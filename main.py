@@ -4,6 +4,7 @@ import re
 import base64
 import httpx
 from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -22,17 +23,38 @@ app = FastAPI(title="Form2Database API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://localhost:5173", "http://localhost:3000"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error: {str(exc)}"},
+        headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*"}
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*"}
+    )
+
+
+
 # ----------------- Models -----------------
 
-class ProcessRequest(BaseModel):
+class SaveRequest(BaseModel):
     filename: str
-    text: str
+    structured_json: dict | None = None
+    text: str | None = None
 
 class ChatRequest(BaseModel):
     message: str
@@ -58,76 +80,96 @@ def extract_json_from_text(text: str) -> dict:
 def health_check():
     return {"status": "ok"}
 
+from rapidocr_onnxruntime import RapidOCR
+
+ocr_engine = RapidOCR()
+
+def paddle_ocr_extract(image_bytes: bytes) -> str:
+    """Extract text from image bytes using PaddleOCR (RapidOCR ONNX engine)."""
+    result, elapse = ocr_engine(image_bytes)
+    if result:
+        lines = [line[1] for line in result]
+        return "\n".join(lines)
+    return ""
+
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
-async def ollama_ocr(image_bytes: bytes, content_type: str) -> str:
-    """Send image to deepseek-ocr via Ollama and return extracted text."""
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    model_name = os.getenv("OCR_MODEL", "deepseek-ocr:3b")
-    print(f"[OCR] Sending {len(image_bytes)} bytes image to Ollama ({model_name}) without timeout limit...")
+async def process_ocr_with_qwen(ocr_text: str, filename: str) -> dict:
+    """Send extracted OCR text to Qwen model to structure into JSON format."""
+    model_name = os.getenv("CHAT_MODEL", "qwen2.5:7b")
+    print(f"[Qwen AI] Formatting extracted text using model '{model_name}'...")
     payload = {
         "model": model_name,
-        "prompt": (
-            "You are an OCR engine. Extract ALL text from this image exactly as it appears. "
-            "Return only the raw extracted text — no commentary, no formatting, no explanation."
-        ),
-        "images": [image_b64],
+        "prompt": f"{processing_system_prompt}\n\nOCR text from '{filename}':\n\n{ocr_text}",
         "stream": False,
         "options": {"temperature": 0}
     }
-    async with httpx.AsyncClient(timeout=None) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
         resp.raise_for_status()
-        text = resp.json().get("response", "").strip()
-        print(f"[OCR] Successfully extracted {len(text)} characters of text from image.")
-        return text
+        raw = resp.json().get("response", "")
+    
+    return extract_json_from_text(raw)
 
 @app.post("/upload_and_ocr")
 async def upload_and_ocr(file: UploadFile = File(...)):
     print(f"[API /upload_and_ocr] Received file: {file.filename}, type: {file.content_type}")
     try:
         content = await file.read()
-        ocr_text = await ollama_ocr(content, file.content_type or "image/jpeg")
-        return {"filename": file.filename, "ocr_text": ocr_text}
-    except httpx.HTTPStatusError as e:
-        print(f"[API /upload_and_ocr Error] Ollama HTTP Error: {e.response.text}")
-        raise HTTPException(status_code=500, detail=f"Ollama OCR failed: {e.response.text}")
+        ocr_text = paddle_ocr_extract(content)
+        print(f"[PaddleOCR] Extracted {len(ocr_text)} characters from {file.filename}")
+        
+        # Process extracted OCR text using Qwen model into structured JSON
+        structured_json = {}
+        if ocr_text:
+            try:
+                structured_json = await process_ocr_with_qwen(ocr_text, file.filename)
+                print(f"[Qwen AI] Successfully structured data into JSON for {file.filename}")
+            except Exception as qwen_err:
+                print(f"[Qwen AI Warning] Could not parse JSON with Qwen: {qwen_err}")
+                structured_json = {"raw_text": ocr_text}
+        
+        return {
+            "filename": file.filename,
+            "ocr_text": ocr_text,
+            "structured_json": structured_json
+        }
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"OCR failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upload & OCR processing failed: {str(e)}")
 
 @app.post("/process_and_save")
-async def process_and_save(req: ProcessRequest):
-    print(f"[API /process_and_save] Processing request for file: {req.filename}")
+@app.post("/save_document")
+async def process_and_save(req: SaveRequest):
+    print(f"[API /process_and_save] Request received for file: '{req.filename}'")
     try:
-        payload = {
-            "model": os.getenv("OCR_MODEL", "deepseek-ocr:3b"),
-            "prompt": f"{processing_system_prompt}\n\nOCR text from '{req.filename}':\n\n{req.text}",
-            "stream": False,
-            "options": {"temperature": 0}
-        }
-        async with httpx.AsyncClient(timeout=None) as client:
-            resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
+        structured_data = None
+        if req.structured_json and isinstance(req.structured_json, dict) and len(req.structured_json) > 0:
+            print(f"[API /process_and_save] Using pre-extracted structured JSON ({len(req.structured_json)} fields)")
+            structured_data = req.structured_json
+        elif req.text:
+            print(f"[Qwen AI] Structuring raw OCR text into JSON for '{req.filename}'...")
+            structured_data = await process_ocr_with_qwen(req.text, req.filename)
 
-        structured_data = extract_json_from_text(raw)
+        if not structured_data:
+            raise ValueError("No valid structured JSON or text provided to save.")
+
+        print(f"[MongoDB] Saving document for '{req.filename}' into collection...")
         result = save_to_mongodb(req.filename, structured_data)
+        print(f"[MongoDB Success] Saved document ID: {result['inserted_id']}")
 
         return {
             "id": result["inserted_id"],
-            "filename": req.filename,
+            "filename": result["stored_filename"],
             "status": "complete",
             "extractedData": result["structured_data"]
         }
-    except httpx.HTTPStatusError as e:
-        print(f"[API /process_and_save Error] Ollama HTTP Error: {e.response.text}")
-        raise HTTPException(status_code=500, detail=f"Ollama processing failed: {e.response.text}")
     except Exception as e:
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Save failed: {str(e)}")
+
 
 @app.post("/chat")
 async def chat_with_agent(req: ChatRequest):

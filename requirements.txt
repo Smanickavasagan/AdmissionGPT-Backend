@@ -8,3 +8,5 @@ langchain
 langchain-core
 langchain-community
 langchain-ollama
+rapidocr-onnxruntime
+pillow
