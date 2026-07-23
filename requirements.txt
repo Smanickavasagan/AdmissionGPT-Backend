@@ -3,8 +3,7 @@ uvicorn
 python-multipart
 pymongo
 motor
-pytesseract
-Pillow
+httpx
 langchain
 langchain-core
 langchain-community

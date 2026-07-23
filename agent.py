@@ -4,12 +4,7 @@ import os
 
 load_dotenv()
 
-OCR_MODEL  = os.getenv("OCR_MODEL",  "deepseek-ocr:3b")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen2.5:7b")
-
-# DeepSeek — used only for OCR structured extraction
-# num_ctx kept small so it fits in RAM alongside other services
-llm_ocr = ChatOllama(model=OCR_MODEL, temperature=0, num_ctx=2048)
 
 # Qwen2.5 — used for natural language chat / DB queries
 llm_chat = ChatOllama(model=CHAT_MODEL, temperature=0, num_ctx=4096)
